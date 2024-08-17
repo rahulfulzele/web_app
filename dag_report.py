@@ -1,129 +1,50 @@
-import pandas as pd
-import fnmatch
-from datetime import datetime
-from airflow.models import DagRun
-from airflow.utils.email import send_email
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.email import EmailOperator
+from airflow.utils.dates import days_ago
+import sys
 
-def generate_and_send_report(include_running=True):
-    today = datetime.now().date()
-    dag_runs = DagRun.find()  # Fetch all DAG runs
+# Add your repository to the Python path
+sys.path.append('/path/to/your/github/repository')
 
-    # Initialize dictionaries for the latest DAG runs
-    latest_dag_runs = {}
+# Import the function from the script
+from dag_report_utils import generate_and_format_report
 
-    # Collect the latest run for each DAG
-    for run in dag_runs:
-        execution_date = run.execution_date.date() if isinstance(run.execution_date, datetime) else run.execution_date
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': days_ago(1),
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
 
-        if execution_date == today:
-            if run.dag_id not in latest_dag_runs or run.execution_date > latest_dag_runs[run.dag_id].execution_date:
-                latest_dag_runs[run.dag_id] = run
+dag = DAG(
+    'ticketing_report',
+    default_args=default_args,
+    description='A DAG to generate a report of failed and optionally running DAG runs for today and send it via email',
+    schedule_interval=timedelta(days=1),
+    max_active_runs=1,  # Limit to 1 active DAG run at a time
+)
 
-    # List of DAGs or patterns to ignore (wildcards supported)
-    ignore_dag_list = ['ignore_this_dag', 'test_*', 'example_*', 'siera_dep*']
+generate_report_task = PythonOperator(
+    task_id='generate_report',
+    python_callable=generate_and_format_report,
+    op_kwargs={'include_running': True},  # Set to False to only include failed DAGs
+    provide_context=True,
+    dag=dag,
+    execution_timeout=timedelta(minutes=10),  # Limit task execution time
+)
 
-    # Filter out DAGs based on the ignore list and their state
-    running_dag_runs = {
-        dag_id: run for dag_id, run in latest_dag_runs.items()
-        if not any(fnmatch.fnmatch(dag_id, pattern) for pattern in ignore_dag_list) and run.state == 'running'
-    }
-    
-    failed_dag_runs = {
-        dag_id: run for dag_id, run in latest_dag_runs.items()
-        if not any(fnmatch.fnmatch(dag_id, pattern) for pattern in ignore_dag_list) and run.state == 'failed'
-    }
+send_email_task = EmailOperator(
+    task_id='send_email',
+    to='boxgideon@gmail.com',
+    subject='DAG Runs Report (Running & Failed)',
+    html_content="{{ task_instance.xcom_pull(task_ids='generate_report') or 'No DAG runs for today.' }}",
+    dag=dag,
+    retries=3,  # Increase retries for the email task
+)
 
-    # Format datetime objects
-    def format_datetime(dt):
-        return dt.strftime('%m-%d-%Y %H:%M:%S') if dt else 'N/A'
-
-    # Generate HTML report
-    def generate_html_section(title, dag_runs):
-        if dag_runs:
-            report = [
-                {
-                    'DAG ID': run.dag_id,
-                    'Execution Date': format_datetime(run.execution_date),
-                    'Start Date': format_datetime(run.start_date),
-                    'End Date': format_datetime(run.end_date),
-                    'State': run.state
-                }
-                for run in dag_runs.values()
-            ]
-            df = pd.DataFrame(report)
-            html = df.to_html(index=False, border=0, classes='dataframe', justify='left')
-            return f"<h2>{title}</h2>{html}"
-        else:
-            return f"<h2>{title}</h2><p>No {title.lower()} for today.</p>"
-
-    if include_running:
-        running_section = generate_html_section("Running DAGs", running_dag_runs)
-    else:
-        running_section = ""
-
-    failed_section = generate_html_section("Failed DAGs", failed_dag_runs)
-
-    styled_html = f"""
-    <html>
-    <head>
-        <style>
-            body {{
-                font-family: 'Helvetica Neue', Arial, sans-serif;
-                color: #4A4A4A;
-                background-color: #F5F5F5;
-                margin: 40px;
-                line-height: 1.6;
-            }}
-            h2 {{
-                color: #0b2f6d;
-                border-bottom: 2px solid #0b2f6d;
-                padding-bottom: 10px;
-            }}
-            p {{
-                font-size: 14px;
-            }}
-            table.dataframe {{
-                width: 100%;
-                border-collapse: collapse;
-                margin: 20px 0;
-                font-size: 14px;
-                background-color: #fff;
-                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-            }}
-            th {{
-                background-color: #0b2f6d;
-                color: white;
-                text-align: left;
-                padding: 10px;
-                border-bottom: 1px solid #ddd;
-            }}
-            td {{
-                padding: 10px;
-                text-align: left;
-                border-bottom: 1px solid #ddd;
-            }}
-            tr {{
-                background-color: #fff;
-            }}
-            tr:hover {{
-                background-color: #f1f1f1;
-            }}
-        </style>
-    </head>
-    <body>
-        <h1>Daily DAG Runs Report</h1>
-        <p>Dear Team,</p>
-        <p>Please find below the report of today's DAG runs.</p>
-        {running_section}
-        {failed_section}
-        <p>Best Regards,<br/>Airflow Monitoring Team</p>
-    </body>
-    </html>
-    """
-
-    # Send email with the report
-    send_email(
-        to='boxgideon@gmail.com',
-        subject='DAG Runs Report (Running & Failed)',
-        html_content=styled_html
-    )
+generate_report_task >> send_email_task
